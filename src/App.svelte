@@ -1,5 +1,34 @@
 <script lang="ts">
+  import { invoke } from "@tauri-apps/api/tauri"
+
   import Greet from './lib/Greet.svelte'
+  import { onDestroy, onMount } from "svelte";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+  interface HeartRateMeasurement {
+    heart_rate: number;
+    sensor_contact_detected: boolean;
+    sensor_contact_supported: boolean;
+    energy_expended_present: boolean;
+    energy_expended: number;
+    rr_interval: Array<number>;
+  }
+
+  let heartRateMeasurement: HeartRateMeasurement | null = null;
+
+  let unlistenFn: UnlistenFn | null = null;
+  
+  onMount(async () => {
+    unlistenFn = await listen("heartRateMeasurement", (e) => heartRateMeasurement = e.payload as HeartRateMeasurement);
+
+    let resp = await invoke("bluetooth_init");
+  })
+
+  onDestroy(() => {
+    if (unlistenFn) {
+      unlistenFn();
+    }
+  })
 </script>
 
 <main class="container">
@@ -19,6 +48,9 @@
 
   <p>
     Click on the Tauri, Vite, and Svelte logos to learn more.
+  </p>
+  <p>
+    Heart Rate: {heartRateMeasurement?.heart_rate}
   </p>
 
   <div class="row">
