@@ -1,29 +1,34 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::sync::atomic::AtomicBool;
 use btleplug::api::Characteristic;
 use btleplug::api::{bleuuid::uuid_from_u16, Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::{Adapter, Manager as BleManager, Peripheral, PeripheralId};
 use futures::stream::StreamExt;
 use tauri::Manager;
 use std::collections::{HashMap, HashSet};
-use std::error::Error;
 
-// Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+mod appsettings;
+use appsettings::AppSettings;
+
+mod heartrate_measurement;
+use heartrate_measurement::HeartRateMeasurement;
+
+mod vrcosc_client;
+use vrcosc_client::VRCOSCClient;
+
+const APP_NAME: &str = "PulseOSC";
+
+static APP_SETTINGS: std::sync::Mutex<Option<AppSettings>> = std::sync::Mutex::new(None);
 
 #[tauri::command]
 fn bluetooth_init(app_handle: tauri::AppHandle) {
-    static mut INITIALIZED: bool = false;
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
     
-    if unsafe { INITIALIZED } {
+    if INITIALIZED.fetch_or(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-
-    unsafe { INITIALIZED = true; }
 
     tokio::spawn(async move {
         bluetooth_adapters_watch(app_handle).await;
@@ -51,7 +56,7 @@ async fn bluetooth_adapters_watch(app_handle: tauri::AppHandle) {
             let app_handle = app_handle.clone();
 
             let task = tokio::spawn(async move {
-                handle_bt_adapter(app_handle, adapter).await.unwrap();
+                handle_bt_adapter(adapter, app_handle).await.unwrap();
             });
 
             running_tasks.push((task, adapter_info.clone()));
@@ -64,7 +69,7 @@ async fn bluetooth_adapters_watch(app_handle: tauri::AppHandle) {
     }
 }
 
-async fn handle_bt_adapter(app_handle: tauri::AppHandle, adapter: Adapter) -> Result<(), Box<dyn Error>> {
+async fn handle_bt_adapter(adapter: Adapter, app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let mut events = adapter.events().await?;
 
     let mut peripherals = HashMap::<PeripheralId, Peripheral>::new();
@@ -94,7 +99,7 @@ async fn handle_bt_adapter(app_handle: tauri::AppHandle, adapter: Adapter) -> Re
 
                     println!("Connected to device with Heart Rate service: {:?}", id);
 
-                    let heartrate_measurement_characteristic = get_heartrate_measurement_characteristic(&peripheral).await;
+                    let heartrate_measurement_characteristic = get_heartrate_measurement_characteristic(&peripheral);
                     if heartrate_measurement_characteristic.is_none() {
                         peripheral.disconnect().await?;
                         continue;
@@ -154,7 +159,7 @@ async fn has_heartrate_service(peripheral: &Peripheral) -> Result<bool, btleplug
     Ok(false)
 }
 
-async fn get_heartrate_measurement_characteristic(peripheral: &Peripheral) -> Option<Characteristic> {
+fn get_heartrate_measurement_characteristic(peripheral: &Peripheral) -> Option<Characteristic> {
     let characteristics = peripheral.characteristics();
 
     for characteristic in characteristics {
@@ -168,20 +173,19 @@ async fn get_heartrate_measurement_characteristic(peripheral: &Peripheral) -> Op
     None
 }
 
-#[derive(Clone, serde::Serialize)]
-struct HeartRateMeasurementPayload {
-    heart_rate: u16,
-    sensor_contact_detected: bool,
-    sensor_contact_supported: bool,
-    energy_expended_present: bool,
-    energy_expended: u16,
-    rr_intervals: Vec<u16>
-}
-
-async fn handle_device(peripheral: &Peripheral, characteristic: &Characteristic, app_handle: tauri::AppHandle) -> Result<(), btleplug::Error> {
+async fn handle_device(peripheral: &Peripheral, characteristic: &Characteristic, app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     peripheral.subscribe(&characteristic).await?;
     
     let mut notification_stream = peripheral.notifications().await?;
+
+    let from_lock = {
+        let app_settings = APP_SETTINGS.lock().unwrap();
+        (*app_settings).clone().expect("App settings not set")
+    };
+
+    let ipv4 = std::net::Ipv4Addr::new(127, 0, 0, 1);
+    let addr = std::net::SocketAddr::new(ipv4.into(), from_lock.osc_port);
+    let mut vrcosc_client = VRCOSCClient::new(&addr);
     
     while let Some(data) = notification_stream.next().await {
         let flags = data.value[0];
@@ -190,7 +194,7 @@ async fn handle_device(peripheral: &Peripheral, characteristic: &Characteristic,
         let sensor_contact_supported = flags & 0b00000100 != 0;
         let energy_expended_present = flags & 0b00001000 != 0;
         let rr_interval_present = flags & 0b00010000 != 0;
-        let  heart_rate: u16;
+        let heart_rate: u16;
         let energy_expended: u16;
         let mut rr_intervals = Vec::<u16>::new();
 
@@ -223,25 +227,86 @@ async fn handle_device(peripheral: &Peripheral, characteristic: &Characteristic,
             }
         }
 
-        println!("Heart Rate: {}, Energy Expended: {:?}, RR Interval: {:?}", heart_rate, energy_expended, rr_intervals);
-
-        app_handle.emit_all("heartRateMeasurement", HeartRateMeasurementPayload {
+        let mesage = HeartRateMeasurement {
             heart_rate,
             sensor_contact_detected,
             sensor_contact_supported,
             energy_expended_present,
             energy_expended,
             rr_intervals
-        }).unwrap();
+        };
+        
+        vrcosc_client.send_heartrate(&mesage)?;
+
+        app_handle.emit_all("heartRateMeasurement", mesage)?;
     }
 
     Ok(())
 }
 
+fn get_app_config_path() -> std::path::PathBuf {
+    let dir = dirs::data_local_dir().expect("Failed to get local app data directory").join(APP_NAME);
+
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).expect("Failed to create app data directory");
+    }
+
+    dir
+}
+
+fn get_app_settings_path() -> std::path::PathBuf {
+    get_app_config_path().join("settings.json")
+}
+
+fn write_app_settings(settings: &AppSettings) {
+    let settings_path = get_app_settings_path();
+
+    let settings_json = serde_json::to_string_pretty(&settings).expect("Failed to serialize settings");
+
+    std::fs::write(&settings_path, settings_json).expect("Failed to write settings file");
+}
+
+fn reset_app_settings() {
+    let app_settings = AppSettings {
+        osc_adress: "127.0.0.1".to_string(),
+        osc_port: 9000
+    };
+
+    write_app_settings(&app_settings);
+
+    APP_SETTINGS.lock().unwrap().replace(app_settings.clone());
+}
+
+fn read_app_settings() {
+    let settings_path = get_app_settings_path();
+
+    if !settings_path.exists() {
+        reset_app_settings();
+        return;
+    }
+
+    let settings_file = std::fs::read_to_string(&settings_path);
+    if settings_file.is_err() {
+        reset_app_settings();
+        return;
+    }
+    let settings_file = settings_file.unwrap();
+
+    let settings = serde_json::from_str::<AppSettings>(&settings_file);
+    if settings.is_err() {
+        reset_app_settings();
+        return;
+    }
+
+    APP_SETTINGS.lock().unwrap().replace(settings.unwrap());
+}
+
 #[tokio::main]
 async fn main() {
+    read_app_settings();
+
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![bluetooth_init, greet])
+        .invoke_handler(tauri::generate_handler![bluetooth_init])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
