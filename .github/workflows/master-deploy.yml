@@ -24,7 +24,7 @@ jobs:
       - name: Build
         run: |
           npm ci
-          npx run tauri build
+          npm run tauri build
 
       - name: Upload binaries to release
         uses: svenstaro/upload-release-action@v2
