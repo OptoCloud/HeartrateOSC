@@ -38,11 +38,13 @@
   }
 </script>
 
-<main class="container">
-  <h1>
-    Heart Rate: {heartRateMeasurement?.heart_rate}
-  </h1>
-  <h1>
-    RR Interval: {heartRateMeasurement ? smooth(heartRateMeasurement.rr_intervals) : 0}
-  </h1>
-</main>
+<div class="container m-auto p-4 flex flex-col justify-stretch items-stretch gap-10">
+	<div class="card m-a p-8 flex flex-col justify-center items-center gap-4">
+		<h1 class="h1 font-bold">
+			Heart Rate: {heartRateMeasurement?.heart_rate}
+		</h1>
+		<h1 class="h1 font-semibold">
+			RR Interval: {heartRateMeasurement ? smooth(heartRateMeasurement.rr_intervals) : 0}
+		</h1>
+	</div>
+</div>
